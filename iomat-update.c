@@ -36,8 +36,8 @@
 #include <getopt.h>
 #include <linux/iomatrix_ioctl.h>
 
-/* Fixed device node */
-static const char *DEFAULT_DEVNODE = "/dev/iomatrix-uapi";
+/* Modify default DEVNODE */
+static const char *DEFAULT_DEVNODE = "/dev/iomatrix-uapi0";
 
 /* Fixed addresses for rts5911 */
 #define RTS5911_AUTO_W_ADDR (0x60000000u)
@@ -59,12 +59,14 @@ static void print_usage(const char *prog)
 		"Options:\n"
 		"  -h, --help           Show this help and exit\n"
 		"  -m, --model <name>   Select model: rts5911 (default) or rts5913 (not supported yet)\n"
+		"  -d, --device <path>  Specify device node (default: %s)\n"
 		"\n"
 		"Example:\n"
 		"  %s -m rts5911 firmware.bin\n"
+		"  %s -d /dev/iomatrix-uapi1 firmware.bin\n"
 		"  %s -m rts5913 firmware.bin  (will report: not supported yet)\n"
 		"\n",
-		prog, prog, prog);
+		prog, DEFAULT_DEVNODE, prog, prog, prog);
 }
 
 static int read_file(const char *path, uint8_t **buf, size_t *len)
@@ -176,8 +178,8 @@ static int write_mems_4k(int fd, uint32_t base_reg, const uint8_t *buf,
 }
 
 /* Common update flow used by rts5911 */
-static int perform_update(const char *imgpath, uint32_t erase_addr,
-			  uint32_t write_addr)
+static int perform_update(const char *devnode, const char *imgpath,
+			  uint32_t erase_addr, uint32_t write_addr)
 {
 	uint8_t *buf = NULL;
 	size_t len = 0;
@@ -189,9 +191,11 @@ static int perform_update(const char *imgpath, uint32_t erase_addr,
 		goto out;
 	}
 
-	fd = open(DEFAULT_DEVNODE, O_RDWR | O_CLOEXEC);
+	printf("Opening device node: %s\n", devnode);
+	fd = open(devnode, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
-		perror("open devnode");
+		fprintf(stderr, "Error: open(%s) failed: %s\n", devnode,
+			strerror(errno));
 		goto out;
 	}
 
@@ -218,9 +222,10 @@ out:
 	return ret;
 }
 
-static int rts5911_update(const char *imgpath)
+static int rts5911_update(const char *devnode, const char *imgpath)
 {
-	return perform_update(imgpath, RTS5911_ERASE_ADDR, RTS5911_AUTO_W_ADDR);
+	return perform_update(devnode, imgpath, RTS5911_ERASE_ADDR,
+			      RTS5911_AUTO_W_ADDR);
 }
 
 static int parse_model(const char *s, rts_model_t *out)
@@ -239,16 +244,19 @@ static int parse_model(const char *s, rts_model_t *out)
 int main(int argc, char **argv)
 {
 	const char *imgpath = NULL;
+	const char *devnode = DEFAULT_DEVNODE; /* Default to uapi0 */
 	rts_model_t model = MODEL_RTS5911;
 
 	static const struct option long_opts[] = {
 		{ "help", no_argument, 0, 'h' },
 		{ "model", required_argument, 0, 'm' },
+		{ "device", required_argument, 0, 'd' },
 		{ 0, 0, 0, 0 }
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "hm:", long_opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "hm:d:", long_opts, NULL)) !=
+	       -1) {
 		switch (opt) {
 		case 'h':
 			print_usage(argv[0]);
@@ -260,6 +268,9 @@ int main(int argc, char **argv)
 					optarg);
 				return 1;
 			}
+			break;
+		case 'd':
+			devnode = optarg;
 			break;
 		default:
 			print_usage(argv[0]);
@@ -277,7 +288,7 @@ int main(int argc, char **argv)
 	int ret;
 	switch (model) {
 	case MODEL_RTS5911:
-		ret = rts5911_update(imgpath);
+		ret = rts5911_update(devnode, imgpath);
 		break;
 	case MODEL_RTS5913:
 		fprintf(stderr,

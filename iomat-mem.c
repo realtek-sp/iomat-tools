@@ -32,22 +32,26 @@
 #include <unistd.h>
 #include <linux/iomatrix_ioctl.h>
 
-#define DEVNODE "/dev/iomatrix-uapi"
-#define ALIGN32 (4)
+/* Modify default DEVNODE */
+#define DEFAULT_DEVNODE "/dev/iomatrix-uapi0"
+#define ALIGN32		(4)
 
 static void usage(const char *prog)
 {
 	fprintf(stdout,
 		"Usage:\n"
-		"  Read:  %s <addr>\n"
-		"  Write: %s <addr> <value>\n"
+		"  Read:  %s [-d device] <addr>\n"
+		"  Write: %s [-d device] <addr> <value>\n"
+		"\n"
+		"Options:\n"
+		"  -d <device>  Specify device node (default: %s)\n"
+		"  -h           Show this help message\n"
 		"\n"
 		"Notes:\n"
 		"  - <addr> and <value> must be hexadecimal with 0x/0X prefix\n"
 		"  - 32-bit access only; <addr> must be 4-byte aligned\n"
-		"  - Device node is fixed: %s\n"
 		"\n",
-		prog, prog, DEVNODE);
+		prog, prog, DEFAULT_DEVNODE);
 }
 
 /* Parse a hex string with 0x/0X prefix into a 32-bit value */
@@ -128,36 +132,57 @@ int main(int argc, char **argv)
 {
 	int fd, ret;
 	uint32_t addr, val, rval;
+	const char *devnode = DEFAULT_DEVNODE;
+	int opt;
+	int args_left;
 
-	/* Help */
-	if (argc == 2 &&
-	    (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
+	/* Support --help explicitly before getopt processing */
+	if (argc >= 2 && !strcmp(argv[1], "--help")) {
 		usage(argv[0]);
 		return 0;
 	}
 
+	/* Parse options: -d for device, -h for help */
+	while ((opt = getopt(argc, argv, "d:h")) != -1) {
+		switch (opt) {
+		case 'd':
+			devnode = optarg;
+			break;
+		case 'h':
+			usage(argv[0]);
+			return 0;
+		default:
+			usage(argv[0]);
+			return 1;
+		}
+	}
+
+	/* Calculate remaining positional arguments */
+	args_left = argc - optind;
+
 	/* Expect either: read (1 arg) or write (2 args) */
-	if (argc != 2 && argc != 3) {
+	if (args_left != 1 && args_left != 2) {
 		usage(argv[0]);
 		return 1;
 	}
 
-	ret = parse_hex_u32(argv[1], &addr);
+	/* Parse Address (first positional arg) */
+	ret = parse_hex_u32(argv[optind], &addr);
 	if (ret) {
 		fprintf(stderr,
 			"Error: invalid addr '%s' (must be hex with 0x/0X): %s\n",
-			argv[1], strerror(-ret));
+			argv[optind], strerror(-ret));
 		return 1;
 	}
 
-	fd = open(DEVNODE, O_RDWR | O_CLOEXEC);
+	fd = open(devnode, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
-		fprintf(stderr, "Error: open(%s) failed: %s\n", DEVNODE,
+		fprintf(stderr, "Error: open(%s) failed: %s\n", devnode,
 			strerror(errno));
 		return 1;
 	}
 
-	if (argc == 2) {
+	if (args_left == 1) {
 		/* Read */
 		ret = do_read(fd, addr, &rval);
 		if (ret) {
@@ -169,12 +194,12 @@ int main(int argc, char **argv)
 		/* Print hex value (devmem-like) */
 		printf("0x%08x\n", rval);
 	} else {
-		/* Write */
-		ret = parse_hex_u32(argv[2], &val);
+		/* Write (second positional arg is value) */
+		ret = parse_hex_u32(argv[optind + 1], &val);
 		if (ret) {
 			fprintf(stderr,
 				"Error: invalid value '%s' (must be hex with 0x/0X): %s\n",
-				argv[2], strerror(-ret));
+				argv[optind + 1], strerror(-ret));
 			goto out_close_err;
 		}
 
