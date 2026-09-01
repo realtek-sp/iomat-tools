@@ -30,276 +30,379 @@
 #include <errno.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <getopt.h>
-#include <linux/iomatrix_ioctl.h>
+#include <dirent.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdbool.h>
 
-/* Modify default DEVNODE */
-static const char *DEFAULT_DEVNODE = "/dev/iomatrix-uapi0";
+#define FW_CLASS_PATH    "/sys/class/firmware"
+#define FW_NAME_PREFIX   "rts591x-ec"
+#define DEFAULT_IMAGE_PATH "/usr/share/iomat-tools/rts5979.bin"
+#define POLL_INTERVAL_US 100000
+#define UPDATE_TIMEOUT_SEC 1200
 
-/* Fixed addresses for rts5911 */
-#define RTS5911_AUTO_W_ADDR (0x60000000u)
-#define RTS5911_ERASE_ADDR  (0x00000000u)
-
-#define CHUNK_SIZE     (4 * 1024) /* 4KB erase and write chunk */
-#define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
-
-typedef enum {
-	MODEL_RTS5911 = 0,
-	MODEL_RTS5913 = 1, /* reserved for future use */
-} rts_model_t;
+static volatile sig_atomic_t cancel_requested;
+static char fw_path[PATH_MAX];
 
 static void print_usage(const char *prog)
 {
 	fprintf(stdout,
-		"Usage: %s [options] <image.bin>\n"
+		"Usage: %s [options] [image.bin]\n"
 		"\n"
 		"Options:\n"
 		"  -h, --help           Show this help and exit\n"
-		"  -m, --model <name>   Select model: rts5911 (default) or rts5913 (not supported yet)\n"
-		"  -d, --device <path>  Specify device node (default: %s)\n"
+		"  -d, --device <name>  firmware_upload name (for example rts591x-ec0)\n"
 		"\n"
-		"Example:\n"
-		"  %s -m rts5911 firmware.bin\n"
-		"  %s -d /dev/iomatrix-uapi1 firmware.bin\n"
-		"  %s -m rts5913 firmware.bin  (will report: not supported yet)\n"
-		"\n",
-		prog, DEFAULT_DEVNODE, prog, prog, prog);
+		"If no image is specified, %s is used.\n"
+		"If -d is omitted, exactly one %s* device must exist under %s.\n",
+		prog, DEFAULT_IMAGE_PATH, FW_NAME_PREFIX, FW_CLASS_PATH);
 }
 
-static int read_file(const char *path, uint8_t **buf, size_t *len)
+static void signal_handler(int signo)
 {
-	int fd = open(path, O_RDONLY | O_CLOEXEC);
-	struct stat st;
-	ssize_t r;
-	int ret = -1;
-
-	if (fd < 0) {
-		perror("open");
-		return ret;
-	}
-
-	if (fstat(fd, &st) < 0) {
-		perror("fstat");
-		goto out;
-	}
-
-	*len = (size_t)st.st_size;
-	if (*len == 0) {
-		fprintf(stderr, "Error: file size is 0\n");
-		goto out;
-	}
-
-	*buf = (uint8_t *)malloc(*len);
-	if (!*buf) {
-		perror("malloc");
-		goto out;
-	}
-
-	r = read(fd, *buf, *len);
-	if (r < 0 || (size_t)r != *len) {
-		perror("read");
-		free(*buf);
-		*buf = NULL;
-		goto out;
-	}
-
-	ret = 0;
-
-out:
-	if (close(fd) < 0) {
-		perror("close");
-	}
-	return ret;
+	(void)signo;
+	cancel_requested = 1;
 }
 
-static int erase_fspi(int fd, uint32_t base_reg, size_t img_len)
+static int make_attr_path(char *path, size_t size, const char *attr)
 {
-	/* Erase length must be multiple of 4KB */
-	size_t erase_len = ALIGN_UP(img_len, CHUNK_SIZE);
-	int ret;
+	int len = snprintf(path, size, "%s/%s", fw_path, attr);
 
-	struct iomatrix_uapi_erase_req ereq = {
-		.addr = base_reg,
-		.len = (uint32_t)erase_len,
-		.type = IOMATRIX_ERASE_4K,
-	};
-
-	printf("FSPI erase start: %zu bytes at 0x%08x type %d\n", erase_len,
-	       base_reg, ereq.type);
-
-	ret = ioctl(fd, IOMATRIX_IOC_ERASE_FSPI, &ereq);
-	if (ret < 0) {
-		perror("ioctl(IOMATRIX_IOC_ERASE)");
+	if (len < 0 || (size_t)len >= size) {
+		errno = ENAMETOOLONG;
 		return -1;
 	}
-
-	printf("FSPI erase ok: %zu bytes at 0x%08x type %d\n", erase_len,
-	       base_reg, ereq.type);
-
 	return 0;
 }
 
-static int write_mems_4k(int fd, uint32_t base_reg, const uint8_t *buf,
-			 size_t len)
+static int write_all(int fd, const void *buf, size_t size)
 {
-	size_t offset = 0;
-	int ret;
+	const char *data = buf;
 
-	printf("MEMS write start: %zu bytes to 0x%08x\n", len, base_reg);
+	while (size) {
+		ssize_t written = write(fd, data, size);
 
-	while (offset < len) {
-		size_t chunk = len - offset;
-		if (chunk > CHUNK_SIZE)
-			chunk = CHUNK_SIZE;
-
-		struct iomatrix_uapi_write_req wreq = {
-			.base_reg = base_reg + (uint32_t)offset,
-			.size = (uint32_t)chunk,
-			.flags = 1,
-			.uptr = (uint32_t)(uintptr_t)(buf + offset),
-		};
-
-		ret = ioctl(fd, IOMATRIX_IOC_WRITE_MEMS, &wreq);
-		if (ret < 0) {
-			fprintf(stderr,
-				"ioctl(IOMATRIX_IOC_WRITE) failed at offset=0x%zx, size=%zu: %s\n",
-				offset, chunk, strerror(errno));
+		if (written < 0) {
+			if (errno == EINTR)
+				continue;
 			return -1;
 		}
-
-		offset += chunk;
+		if (!written) {
+			errno = EIO;
+			return -1;
+		}
+		data += written;
+		size -= (size_t)written;
 	}
-
-	printf("MEMS write OK: %zu bytes to 0x%08x\n", len, base_reg);
 	return 0;
 }
 
-/* Common update flow used by rts5911 */
-static int perform_update(const char *devnode, const char *imgpath,
-			  uint32_t erase_addr, uint32_t write_addr)
+static int write_attr(const char *attr, const char *value)
 {
-	uint8_t *buf = NULL;
-	size_t len = 0;
-	int fd = -1;
-	int ret = -1;
+	char path[PATH_MAX];
+	int fd;
+	int ret;
 
-	if (read_file(imgpath, &buf, &len) < 0) {
-		fprintf(stderr, "Failed to read image: %s\n", imgpath);
-		goto out;
-	}
-
-	printf("Opening device node: %s\n", devnode);
-	fd = open(devnode, O_RDWR | O_CLOEXEC);
-	if (fd < 0) {
-		fprintf(stderr, "Error: open(%s) failed: %s\n", devnode,
-			strerror(errno));
-		goto out;
-	}
-
-	/* 1) Erase FSPI in 4KB blocks */
-	if (erase_fspi(fd, erase_addr, len) < 0) {
-		goto out;
-	}
-
-	/* Fixed 0.5s delay between erase and write */
-	usleep(500000);
-
-	/* 2) Write MEMS in 4KB chunks */
-	if (write_mems_4k(fd, write_addr, buf, len) < 0) {
-		goto out;
-	}
-
-	ret = 0;
-
-out:
-	if (fd >= 0)
-		close(fd);
-	if (buf)
-		free(buf);
+	if (make_attr_path(path, sizeof(path), attr))
+		return -1;
+	fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	ret = write_all(fd, value, strlen(value));
+	if (close(fd) && !ret)
+		ret = -1;
 	return ret;
 }
 
-static int rts5911_update(const char *devnode, const char *imgpath)
+static int read_attr(const char *attr, char *buf, size_t size)
 {
-	return perform_update(devnode, imgpath, RTS5911_ERASE_ADDR,
-			      RTS5911_AUTO_W_ADDR);
+	char path[PATH_MAX];
+	ssize_t len;
+	int fd;
+
+	if (size < 2) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (make_attr_path(path, sizeof(path), attr))
+		return -1;
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	do {
+		len = read(fd, buf, size - 1);
+	} while (len < 0 && errno == EINTR);
+	if (close(fd) && len >= 0) {
+		errno = EIO;
+		return -1;
+	}
+	if (len < 0)
+		return -1;
+
+	while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+		len--;
+	buf[len] = '\0';
+	return 0;
 }
 
-static int parse_model(const char *s, rts_model_t *out)
+static int validate_fw_device(void)
 {
-	if (strcasecmp(s, "rts5911") == 0) {
-		*out = MODEL_RTS5911;
+	static const char *const attrs[] = {
+		"loading", "data", "status", "error", "remaining_size", "cancel",
+	};
+	char path[PATH_MAX];
+	size_t i;
+
+	for (i = 0; i < sizeof(attrs) / sizeof(attrs[0]); i++) {
+		if (make_attr_path(path, sizeof(path), attrs[i]))
+			return -1;
+		if (access(path, F_OK))
+			return -1;
+	}
+	return 0;
+}
+
+static int select_fw_device(const char *name)
+{
+	struct dirent *entry;
+	DIR *dir;
+	unsigned int count = 0;
+	int len;
+
+	if (name) {
+		if (strchr(name, '/')) {
+			fprintf(stderr, "Error: -d expects a firmware_upload name, not a path\n");
+			return -1;
+		}
+		len = snprintf(fw_path, sizeof(fw_path), "%s/%s", FW_CLASS_PATH, name);
+		if (len < 0 || (size_t)len >= sizeof(fw_path)) {
+			errno = ENAMETOOLONG;
+			perror("firmware_upload device");
+			return -1;
+		}
+		if (validate_fw_device()) {
+			perror("firmware_upload device");
+			return -1;
+		}
 		return 0;
 	}
-	if (strcasecmp(s, "rts5913") == 0) {
-		*out = MODEL_RTS5913;
-		return 0;
+
+	dir = opendir(FW_CLASS_PATH);
+	if (!dir) {
+		perror(FW_CLASS_PATH);
+		return -1;
 	}
-	return -1;
+	while ((entry = readdir(dir))) {
+		if (strncmp(entry->d_name, FW_NAME_PREFIX,
+			    strlen(FW_NAME_PREFIX)))
+			continue;
+		len = snprintf(fw_path, sizeof(fw_path), "%s/%s", FW_CLASS_PATH,
+			       entry->d_name);
+		if (len < 0 || (size_t)len >= sizeof(fw_path)) {
+			closedir(dir);
+			errno = ENAMETOOLONG;
+			perror("firmware_upload device");
+			return -1;
+		}
+		count++;
+	}
+	closedir(dir);
+
+	if (count != 1) {
+		fprintf(stderr, "Error: found %u %s* devices; use -d to select one\n",
+			count, FW_NAME_PREFIX);
+		return -1;
+	}
+	if (validate_fw_device()) {
+		perror("firmware_upload device");
+		return -1;
+	}
+	return 0;
+}
+
+static int copy_image(const char *image)
+{
+	char path[PATH_MAX];
+	char buf[65536];
+	ssize_t len;
+	int in;
+	int out;
+	int ret = -1;
+
+	in = open(image, O_RDONLY | O_CLOEXEC);
+	if (in < 0)
+		return -1;
+	if (make_attr_path(path, sizeof(path), "data"))
+		goto out_in;
+	out = open(path, O_WRONLY | O_CLOEXEC);
+	if (out < 0)
+		goto out_in;
+
+	while ((len = read(in, buf, sizeof(buf))) != 0) {
+		if (len < 0) {
+			if (errno == EINTR)
+				continue;
+			goto out_both;
+		}
+		if (write_all(out, buf, (size_t)len))
+			goto out_both;
+	}
+	ret = 0;
+
+out_both:
+	if (close(out) && !ret)
+		ret = -1;
+out_in:
+	if (close(in) && !ret)
+		ret = -1;
+	return ret;
+}
+
+static int wait_for_idle(void)
+{
+	char previous[32] = "";
+	char status[32];
+	char remaining[32];
+	char error[128];
+	unsigned int elapsed = 0;
+	bool cancel_sent = false;
+
+	for (;;) {
+		if (cancel_requested && !cancel_sent) {
+			if (write_attr("cancel", "1"))
+				perror("cancel");
+			else
+				fprintf(stderr, "Cancellation requested\n");
+			cancel_sent = true;
+		}
+		if (read_attr("status", status, sizeof(status)) ||
+		    read_attr("remaining_size", remaining, sizeof(remaining)))
+			return -1;
+		if (strcmp(previous, status)) {
+			printf("status=%s remaining=%s\n", status, remaining);
+			strncpy(previous, status, sizeof(previous) - 1);
+			previous[sizeof(previous) - 1] = '\0';
+		}
+		if (!strcmp(status, "idle"))
+			break;
+		if (elapsed >= UPDATE_TIMEOUT_SEC * 10U) {
+			fprintf(stderr, "Error: update timed out after %u seconds\n",
+				UPDATE_TIMEOUT_SEC);
+			if (!cancel_sent)
+				write_attr("cancel", "1");
+			errno = ETIMEDOUT;
+			return -1;
+		}
+		usleep(POLL_INTERVAL_US);
+		elapsed++;
+	}
+
+	if (read_attr("error", error, sizeof(error)))
+		return -1;
+	if (cancel_sent) {
+		fprintf(stderr, "Error: update was canceled\n");
+		errno = ECANCELED;
+		return -1;
+	}
+	if (*error) {
+		fprintf(stderr, "Error: firmware update failed: %s\n", error);
+		errno = EIO;
+		return -1;
+	}
+	return 0;
 }
 
 int main(int argc, char **argv)
 {
-	const char *imgpath = NULL;
-	const char *devnode = DEFAULT_DEVNODE; /* Default to uapi0 */
-	rts_model_t model = MODEL_RTS5911;
-
 	static const struct option long_opts[] = {
-		{ "help", no_argument, 0, 'h' },
-		{ "model", required_argument, 0, 'm' },
-		{ "device", required_argument, 0, 'd' },
+		{ "device", required_argument, NULL, 'd' },
+		{ "help", no_argument, NULL, 'h' },
 		{ 0, 0, 0, 0 }
 	};
-
+	const char *device = NULL;
+	const char *image;
+	struct sigaction sa = { 0 };
+	struct stat st;
+	char status[32];
 	int opt;
-	while ((opt = getopt_long(argc, argv, "hm:d:", long_opts, NULL)) !=
-	       -1) {
+
+	while ((opt = getopt_long(argc, argv, "d:h", long_opts, NULL)) != -1) {
 		switch (opt) {
+		case 'd':
+			device = optarg;
+			break;
 		case 'h':
 			print_usage(argv[0]);
 			return 0;
-		case 'm':
-			if (parse_model(optarg, &model) < 0) {
-				fprintf(stderr,
-					"Error: invalid model '%s', use rts5911 or rts5913\n",
-					optarg);
-				return 1;
-			}
-			break;
-		case 'd':
-			devnode = optarg;
-			break;
 		default:
 			print_usage(argv[0]);
 			return 1;
 		}
 	}
-
-	if (optind >= argc) {
-		fprintf(stderr, "Error: missing <image.bin>\n");
+	if (optind + 1 < argc) {
 		print_usage(argv[0]);
 		return 1;
 	}
-	imgpath = argv[optind];
+	image = optind < argc ? argv[optind] : DEFAULT_IMAGE_PATH;
 
-	int ret;
-	switch (model) {
-	case MODEL_RTS5911:
-		ret = rts5911_update(devnode, imgpath);
-		break;
-	case MODEL_RTS5913:
-		fprintf(stderr,
-			"Error: rts5913 update is not supported yet. Framework reserved.\n");
-		ret = 1;
-		break;
-	default:
-		fprintf(stderr, "Error: unknown model\n");
-		ret = 1;
-		break;
+	if (geteuid()) {
+		fprintf(stderr, "Error: this tool must run as root\n");
+		return 1;
+	}
+	if (stat(image, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+		perror("image");
+		return 1;
+	}
+	if (select_fw_device(device))
+		return 1;
+	if (read_attr("status", status, sizeof(status))) {
+		perror("status");
+		return 1;
+	}
+	if (strcmp(status, "idle")) {
+		fprintf(stderr, "Error: firmware_upload device is busy: %s\n", status);
+		return 1;
 	}
 
-	return ret == 0 ? 0 : 1;
+	printf("Firmware device: %s\n", fw_path);
+	printf("Image: %s\n", image);
+	printf("Image size: %lld bytes\n", (long long)st.st_size);
+	printf("WARNING: this updates the active EC boot flash.\n");
+	printf("Power loss, cancellation, or an invalid image may make the EC unbootable.\n");
+
+	sa.sa_handler = signal_handler;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+
+	if (write_attr("loading", "1")) {
+		perror("loading=1");
+		return 1;
+	}
+	if (copy_image(image)) {
+		int saved_errno = errno;
+
+		write_attr("loading", "-1");
+		errno = saved_errno;
+		perror("firmware data");
+		return 1;
+	}
+	if (cancel_requested) {
+		write_attr("loading", "-1");
+		fprintf(stderr, "Aborted\n");
+		return 1;
+	}
+	if (write_attr("loading", "0")) {
+		perror("loading=0");
+		return 1;
+	}
+	if (wait_for_idle())
+		return 1;
+
+	printf("SUCCESS: EC firmware update via firmware_upload passed\n");
+	printf("Reset or power-cycle the EC to activate the image.\n");
+	return 0;
 }

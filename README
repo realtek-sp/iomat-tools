@@ -1,10 +1,11 @@
 iomat-tools
 ===========
 
-Tools for interacting with the Realtek RTS5911 iomatrix device:
+Tools for interacting with the Realtek I/O Expander device:
 
-  o iomat-update - update EC (and other) firmware over the iomatrix device node
-  o iomat-mem     - memory access helper for the iomatrix device
+  o iomat-update - update EC firmware over the kernel firmware_upload
+                  interface (/sys/class/firmware/rts591x-ec*)
+  o iomat-mem     - memory access helper over the iomatrix device node
 
 
 EC firmware image
@@ -12,12 +13,11 @@ EC firmware image
 
 The EC main image is installed to the rootfs at:
 
-    /usr/share/iomat-tools/EC_Main_Image.bin
+    /usr/share/iomat-tools/rts5979.bin
 
 The on-disk name is kept stable so iomat-update can reference a fixed
 path.  Each time the EC image is updated, the new bin is tracked in this
-repository by its upload date.  Replace EC_Main_Image.bin and add a row
-below.
+repository by its upload date.  Replace rts5979.bin and add a row below.
 
 
 Version history
@@ -32,8 +32,8 @@ Bins are identified by upload date.
       TACHO, I2C master, and ACPI IBF
     - Add GPIO interrupt report (EC GPIO state changes can be reported
       for host/SoC monitoring)
-    - Add in-band EC flash update from SoC (iomat-update erases and
-      writes via the iomatrix interface)
+    - Add in-band EC flash update from SoC (iomat-update flashes via the
+      firmware_upload interface)
     - Enhance iomatrix services: PECI OOB forwarding, Port80 interrupt
       forwarding to the snoop channel, PM IBF interrupt bits
     - Align iomatrix protocol stack with Linux: KCS state machine now
@@ -44,8 +44,15 @@ Bins are identified by upload date.
 Usage
 -----
 
-Update EC firmware using the installed image:
+Update EC firmware with the installed image (also the default when no
+image is given):
 
-    iomat-update -m rts5911 /usr/share/iomat-tools/EC_Main_Image.bin
+    iomat-update
 
-See 'iomat-update --help' for all options (device node, model selection).
+Update EC firmware with an image at a specified path:
+
+    iomat-update path/image.bin
+
+The tool auto-detects a single rts591x-ec* firmware_upload device; use
+-d to select one when more than one exists.  See 'iomat-update --help'
+for details.
