@@ -1,0 +1,51 @@
+iomat-tools
+===========
+
+Tools for interacting with the Realtek RTS5911 iomatrix device:
+
+  o iomat-update - update EC (and other) firmware over the iomatrix device node
+  o iomat-mem     - memory access helper for the iomatrix device
+
+
+EC firmware image
+-----------------
+
+The EC main image is installed to the rootfs at:
+
+    /usr/share/iomat-tools/EC_Main_Image.bin
+
+The on-disk name is kept stable so iomat-update can reference a fixed
+path.  Each time the EC image is updated, the new bin is tracked in this
+repository by its upload date.  Replace EC_Main_Image.bin and add a row
+below.
+
+
+Version history
+---------------
+
+Bins are identified by upload date.
+
+2026-09-01
+    - Add IO expander I2C slave protocol, GPIO table init, I2C master
+      interrupt module (oem_i2cm), and ERRLOG region
+    - Add peripheral event callbacks and interrupt status bits for ADC,
+      TACHO, I2C master, and ACPI IBF
+    - Add GPIO interrupt report (EC GPIO state changes can be reported
+      for host/SoC monitoring)
+    - Add in-band EC flash update from SoC (iomat-update erases and
+      writes via the iomatrix interface)
+    - Enhance iomatrix services: PECI OOB forwarding, Port80 interrupt
+      forwarding to the snoop channel, PM IBF interrupt bits
+    - Align iomatrix protocol stack with Linux: KCS state machine now
+      driven by IBF interrupt forwarding, IRQ bitmap aligned
+    - Fix: restore LDN UART after eSPI reset
+
+
+Usage
+-----
+
+Update EC firmware using the installed image:
+
+    iomat-update -m rts5911 /usr/share/iomat-tools/EC_Main_Image.bin
+
+See 'iomat-update --help' for all options (device node, model selection).
