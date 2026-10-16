@@ -25,6 +25,12 @@ Version history
 
 Bins are identified by upload date.
 
+2026-10-16
+    - Add KCS channel at I/O ports 0xCA0/0xCA1
+    - Optimize I2C transfer timing with the SoC
+    - Note: update the EC firmware first, then the SoC image (kernel
+      and rootfs)
+
 2026-09-01
     - Add IO expander I2C slave protocol, GPIO table init, I2C master
       interrupt module (oem_i2cm), and ERRLOG region
